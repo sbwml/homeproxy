@@ -281,6 +281,14 @@ return view.extend({
 			return true;
 		}
 
+		o = s.taboption('routing', form.ListValue, 'dns_mode', _('DNS resolution mode'),
+			_('Fake-IP mode maps proxy traffic to synthetic IPs and restores domain names for remote proxy routing. Real-IP resolves domains directly.'));
+		o.value('fakeip', _('Fake-IP'));
+		o.value('realip', _('Real-IP'));
+		o.default = 'fakeip';
+		o.depends({'routing_mode': 'custom', '!reverse': true});
+		o.rmempty = false;
+
 		o = s.taboption('routing', form.ListValue, 'proxy_mode', _('Proxy mode'));
 		o.value('redirect', _('Redirect TCP'));
 		if (features.hp_has_tproxy)
@@ -344,15 +352,19 @@ return view.extend({
 			_('Bypass mainland China traffic via firewall rules by default.'));
 		so.rmempty = false;
 
+		so = ss.option(form.ListValue, 'dns_mode', _('DNS resolution mode'),
+			_('Fake-IP mode maps proxy traffic to synthetic IPs and restores domain names for remote proxy routing. Real-IP resolves domains directly.'));
+		so.value('fakeip', _('Fake-IP'));
+		so.value('realip', _('Real-IP'));
+		so.default = 'fakeip';
+		so.rmempty = false;
+
 		so = ss.option(form.ListValue, 'domain_strategy', _('Domain strategy'),
-			_('If set, the requested domain name will be resolved to IP before routing.'));
+			_('If set, the requested domain name will be resolved to IP before routing.') + '<br/>' +
+			_('Only effective when <em>DNS resolution mode</em> is set to <em>Real-IP</em>.'));
 		for (let i in hp.dns_strategy)
 			so.value(i, hp.dns_strategy[i]);
-
-		so = ss.option(form.Flag, 'sniff_override', _('Override destination'),
-			_('Override the connection destination address with the sniffed domain.'));
-		so.default = so.enabled;
-		so.rmempty = false;
+		so.depends('homeproxy.routing.dns_mode', 'realip');
 
 		so = ss.option(form.ListValue, 'default_outbound', _('Default outbound'),
 			_('Default outbound for connections not matched by any routing rules.'));
@@ -887,7 +899,7 @@ return view.extend({
 			this.value('default-dns', _('Default DNS (issued by WAN)'));
 			this.value('system-dns', _('System DNS'));
 			uci.sections(data[0], 'dns_server', (res) => {
-				if (res.enabled === '1')
+				if (res.enabled === '1' && res.type !== 'fakeip')
 					this.value(res['.name'], res.label);
 			});
 
@@ -951,18 +963,35 @@ return view.extend({
 		so.value('https', _('HTTPS'));
 		so.value('h3', _('HTTP/3'));
 		so.value('quic', _('QUIC'));
+		so.value('fakeip', _('Fake-IP'));
 		so.default = 'udp';
 		so.rmempty = false;
 
 		so = ss.option(form.Value, 'server', _('Address'),
 			_('The address of the dns server.'));
 		so.datatype = 'or(hostname, ipaddr)';
+		so.depends({'type': 'fakeip', '!reverse': true});
 		so.rmempty = false;
 
 		so = ss.option(form.Value, 'server_port', _('Port'),
 			_('The port of the DNS server.'));
 		so.placeholder = 'auto';
 		so.datatype = 'port';
+		so.depends({'type': 'fakeip', '!reverse': true});
+
+		so = ss.option(form.Value, 'inet4_range', _('IPv4 Fake-IP range'),
+			_('IPv4 CIDR range for Fake-IP pool, e.g. <code>198.18.0.0/15</code>.'));
+		so.placeholder = '198.18.0.0/15';
+		so.datatype = 'cidr4';
+		so.depends('type', 'fakeip');
+		so.modalonly = true;
+
+		so = ss.option(form.Value, 'inet6_range', _('IPv6 Fake-IP range'),
+			_('IPv6 CIDR range for Fake-IP pool, e.g. <code>fc00::/18</code>.'));
+		so.placeholder = 'fc00::/18';
+		so.datatype = 'cidr6';
+		so.depends('type', 'fakeip');
+		so.modalonly = true;
 
 		so = ss.option(form.Value, 'path', _('Path'),
 			_('The path of the DNS server.'));
@@ -987,6 +1016,7 @@ return view.extend({
 
 		so = ss.option(form.ListValue, 'address_resolver', _('Address resolver'),
 			_('Tag of a another server to resolve the domain name in the address. Required if address contains domain.'));
+		so.depends({'type': 'fakeip', '!reverse': true});
 		so.load = function(section_id) {
 			delete this.keylist;
 			delete this.vallist;
@@ -1026,6 +1056,7 @@ return view.extend({
 
 		so = ss.option(form.ListValue, 'outbound', _('Outbound'),
 			_('Tag of an outbound for connecting to the dns server.'));
+		so.depends({'type': 'fakeip', '!reverse': true});
 		so.load = function(section_id) {
 			delete this.keylist;
 			delete this.vallist;

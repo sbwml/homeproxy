@@ -239,6 +239,40 @@ uci.foreach(uciconfig, uciroutingrule, (cfg) => {
 	}
 });
 
+/* sniff_override was replaced by dns_mode in sb 1.14 */
+const legacy_sniff = uci.get(uciconfig, ucirouting, 'sniff_override') ??
+                     uci.get(uciconfig, ucimain, 'sniff_override') ??
+                     uci.get(uciconfig, uciinfra, 'sniff_override');
+if (!isEmpty(legacy_sniff)) {
+	const migrated_mode = (legacy_sniff === '0') ? 'realip' : 'fakeip';
+	if (isEmpty(uci.get(uciconfig, ucimain, 'dns_mode')))
+		uci.set(uciconfig, ucimain, 'dns_mode', migrated_mode);
+	if (isEmpty(uci.get(uciconfig, ucirouting, 'dns_mode')))
+		uci.set(uciconfig, ucirouting, 'dns_mode', migrated_mode);
+	uci.delete(uciconfig, ucirouting, 'sniff_override');
+	uci.delete(uciconfig, ucimain, 'sniff_override');
+	uci.delete(uciconfig, uciinfra, 'sniff_override');
+}
+
+if (isEmpty(uci.get(uciconfig, ucimain, 'dns_mode')))
+	uci.set(uciconfig, ucimain, 'dns_mode', 'fakeip');
+
+if (isEmpty(uci.get(uciconfig, ucirouting, 'dns_mode')))
+	uci.set(uciconfig, ucirouting, 'dns_mode', 'fakeip');
+
+/* removed / deprecated in sb 1.14 */
+if (!isEmpty(uci.get(uciconfig, ucidns, 'disable_expire')))
+	uci.delete(uciconfig, ucidns, 'disable_expire');
+
+if (!isEmpty(uci.get(uciconfig, ucidns, 'independent_cache')))
+	uci.delete(uciconfig, ucidns, 'independent_cache');
+
+if (!isEmpty(uci.get(uciconfig, ucidns, 'cache_file_store_rdrc')))
+	uci.delete(uciconfig, ucidns, 'cache_file_store_rdrc');
+
+if (!isEmpty(uci.get(uciconfig, ucidns, 'cache_file_rdrc_timeout')))
+	uci.delete(uciconfig, ucidns, 'cache_file_rdrc_timeout');
+
 /* server options */
 /* auto_firewall was moved into server options */
 const auto_firewall = uci.get(uciconfig, uciserver, 'auto_firewall');

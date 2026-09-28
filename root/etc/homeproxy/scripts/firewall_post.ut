@@ -23,7 +23,7 @@ function resolve_ipv6(str) {
 		return null;
 
 	if (ipv6.bits > -1)
-		return `${ipv6.addr}/${ipv6.bits}`;
+		return ipv6.addr + '/' + ipv6.bits;
 	else
 		return `& ${ipv6.mask} == ${ipv6.addr}`;
 }
@@ -66,6 +66,26 @@ if (routing_mode !== 'custom') {
 } else {
 	outbound_node = uci.get(cfgname, 'routing', 'default_outbound') || 'nil';
 	bypass_cn_traffic = uci.get(cfgname, 'routing', 'bypass_cn_traffic') || '0';
+}
+
+let dns_mode = uci.get(cfgname, (routing_mode === 'custom') ? 'routing' : 'config', 'dns_mode') ??
+              uci.get(cfgname, 'config', 'dns_mode') ??
+              uci.get(cfgname, 'routing', 'dns_mode');
+if (isEmpty(dns_mode)) {
+	let sniff = uci.get(cfgname, 'routing', 'sniff_override') ??
+	            uci.get(cfgname, 'config', 'sniff_override') ??
+	            uci.get(cfgname, 'infra', 'sniff_override');
+	dns_mode = (sniff === '0') ? 'realip' : 'fakeip';
+}
+
+let has_fakeip = (dns_mode === 'fakeip');
+if (!has_fakeip && routing_mode === 'custom') {
+	uci.foreach(cfgname, 'dns_server', (cfg) => {
+		if (cfg.enabled === '1' && cfg.type === 'fakeip') {
+			has_fakeip = true;
+			return false;
+		}
+	});
 }
 
 let routing_port = uci.get(cfgname, 'config', 'routing_port');
@@ -317,6 +337,13 @@ chain homeproxy_redirect {
 	ip6 daddr @homeproxy_wan_proxy_addr_v6 counter goto homeproxy_redirect_proxy_port
 	{% endif %}
 
+	{% if (has_fakeip): %}
+	ip daddr 198.18.0.0/15 counter goto homeproxy_redirect_proxy_port
+	{% if (ipv6_support === '1'): %}
+	ip6 daddr fc00::/18 counter goto homeproxy_redirect_proxy_port
+	{% endif %}
+	{% endif %}
+
 	ip daddr @homeproxy_local_addr_v4 counter return
 	{% if (ipv6_support === '1'): %}
 	ip6 daddr @homeproxy_local_addr_v6 counter return
@@ -438,6 +465,13 @@ chain homeproxy_mangle_prerouting {
 	ip6 daddr @homeproxy_wan_proxy_addr_v6 counter goto homeproxy_mangle_tproxy_port
 	{% endif %}
 
+	{% if (has_fakeip): %}
+	ip daddr 198.18.0.0/15 counter goto homeproxy_mangle_tproxy_port
+	{% if (ipv6_support === '1'): %}
+	ip6 daddr fc00::/18 counter goto homeproxy_mangle_tproxy_port
+	{% endif %}
+	{% endif %}
+
 	ip daddr @homeproxy_local_addr_v4 counter return
 	{% if (ipv6_support === '1'): %}
 	ip6 daddr @homeproxy_local_addr_v6 counter return
@@ -500,6 +534,13 @@ chain homeproxy_mangle_output {
 	ip daddr @homeproxy_wan_proxy_addr_v4 counter goto homeproxy_mangle_mark
 	{% if (ipv6_support === '1'): %}
 	ip6 daddr @homeproxy_wan_proxy_addr_v6 counter goto homeproxy_mangle_mark
+	{% endif %}
+
+	{% if (has_fakeip): %}
+	ip daddr 198.18.0.0/15 counter goto homeproxy_mangle_mark
+	{% if (ipv6_support === '1'): %}
+	ip6 daddr fc00::/18 counter goto homeproxy_mangle_mark
+	{% endif %}
 	{% endif %}
 
 	ip daddr @homeproxy_local_addr_v4 counter return
@@ -595,6 +636,13 @@ chain homeproxy_mangle_tun {
 	ip daddr @homeproxy_wan_proxy_addr_v4 counter goto homeproxy_mangle_tun_mark
 	{% if (ipv6_support === '1'): %}
 	ip6 daddr @homeproxy_wan_proxy_addr_v6 counter goto homeproxy_mangle_tun_mark
+	{% endif %}
+
+	{% if (has_fakeip): %}
+	ip daddr 198.18.0.0/15 counter goto homeproxy_mangle_tun_mark
+	{% if (ipv6_support === '1'): %}
+	ip6 daddr fc00::/18 counter goto homeproxy_mangle_tun_mark
+	{% endif %}
 	{% endif %}
 
 	ip daddr @homeproxy_local_addr_v4 counter return

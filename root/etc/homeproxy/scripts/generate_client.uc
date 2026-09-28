@@ -44,6 +44,17 @@ const uciruleset = 'ruleset';
 
 const routing_mode = uci.get(uciconfig, ucimain, 'routing_mode') || 'bypass_mainland_china';
 
+/* 'dns_mode' controls DNS resolution mode: 'fakeip' (default, overrides destination with domain for remote proxy routing) or 'realip' */
+let dns_mode = uci.get(uciconfig, (routing_mode === 'custom') ? uciroutingsetting : ucimain, 'dns_mode') ??
+              uci.get(uciconfig, ucimain, 'dns_mode') ??
+              uci.get(uciconfig, uciroutingsetting, 'dns_mode');
+if (isEmpty(dns_mode)) {
+	let sniff = uci.get(uciconfig, uciroutingsetting, 'sniff_override') ??
+	            uci.get(uciconfig, ucimain, 'sniff_override') ??
+	            uci.get(uciconfig, uciinfra, 'sniff_override');
+	dns_mode = (sniff === '0') ? 'realip' : 'fakeip';
+}
+
 let wan_dns = ubus.call('network.interface', 'status', {'interface': 'wan'})?.['dns-server']?.[0];
 if (!wan_dns)
 	wan_dns = (routing_mode in ['proxy_mainland_china', 'global']) ? '8.8.8.8' : '223.5.5.5';
@@ -55,10 +66,9 @@ const ntp_server = uci.get(uciconfig, uciinfra, 'ntp_server') || 'time.apple.com
 const ipv6_support = uci.get(uciconfig, ucimain, 'ipv6_support') || '0';
 
 let main_node, main_udp_node, dedicated_udp_node, default_outbound, default_outbound_dns,
-    domain_strategy, sniff_override, dns_server, china_dns_server, dns_default_strategy,
-    dns_default_server, dns_disable_cache, dns_disable_cache_expire, dns_independent_cache,
-    dns_client_subnet, cache_file_store_rdrc, cache_file_rdrc_timeout, direct_domain_list,
-    proxy_domain_list;
+    domain_strategy, dns_server, china_dns_server, dns_default_strategy,
+    dns_default_server, dns_disable_cache, dns_client_subnet,
+    direct_domain_list, proxy_domain_list, has_fakeip = false, fakeip_tag = null;
 
 if (routing_mode !== 'custom') {
 	main_node = uci.get(uciconfig, ucimain, 'main_node') || 'nil';
@@ -83,24 +93,17 @@ if (routing_mode !== 'custom') {
 	proxy_domain_list = trim(readfile(HP_DIR + '/resources/proxy_list.txt'));
 	if (proxy_domain_list)
 		proxy_domain_list = split(proxy_domain_list, /[\r\n]/);
-
-	sniff_override = uci.get(uciconfig, uciinfra, 'sniff_override') || '1';
 } else {
 	/* DNS settings */
 	dns_default_strategy = uci.get(uciconfig, ucidnssetting, 'default_strategy');
 	dns_default_server = uci.get(uciconfig, ucidnssetting, 'default_server');
 	dns_disable_cache = uci.get(uciconfig, ucidnssetting, 'disable_cache');
-	dns_disable_cache_expire = uci.get(uciconfig, ucidnssetting, 'disable_cache_expire');
-	dns_independent_cache = uci.get(uciconfig, ucidnssetting, 'independent_cache');
 	dns_client_subnet = uci.get(uciconfig, ucidnssetting, 'client_subnet');
-	cache_file_store_rdrc = uci.get(uciconfig, ucidnssetting, 'cache_file_store_rdrc'),
-	cache_file_rdrc_timeout = uci.get(uciconfig, ucidnssetting, 'cache_file_rdrc_timeout');
 
 	/* Routing settings */
 	default_outbound = uci.get(uciconfig, uciroutingsetting, 'default_outbound') || 'nil';
 	default_outbound_dns = uci.get(uciconfig, uciroutingsetting, 'default_outbound_dns') || 'default-dns';
 	domain_strategy = uci.get(uciconfig, uciroutingsetting, 'domain_strategy');
-	sniff_override = uci.get(uciconfig, uciroutingsetting, 'sniff_override');
 }
 
 const proxy_mode = uci.get(uciconfig, ucimain, 'proxy_mode') || 'redirect_tproxy',
@@ -385,6 +388,15 @@ function get_resolver(cfg) {
 	}
 }
 
+function generate_sniff_rules() {
+	/* 'sniff' was an inbound field and has to be requested by a route rule
+	 * since sb 1.14. It inspects connection protocol/domain metadata for rule matching. */
+	return [{
+		action: 'sniff',
+		timeout: '300ms'
+	}];
+}
+
 function get_ruleset(cfg) {
 	if (isEmpty(cfg))
 		return null;
@@ -434,12 +446,22 @@ config.dns = {
 	rules: [],
 	strategy: dns_default_strategy,
 	disable_cache: strToBool(dns_disable_cache),
-	disable_expire: strToBool(dns_disable_cache_expire),
-	independent_cache: strToBool(dns_independent_cache),
+	/* 'disable_expire' was removed, 'independent_cache' is deprecated in sb 1.14 */
 	client_subnet: dns_client_subnet
 };
 
 if (!isEmpty(main_node)) {
+	if (dns_mode === 'fakeip') {
+		fakeip_tag = 'fakeip-dns';
+		has_fakeip = true;
+		push(config.dns.servers, {
+			tag: fakeip_tag,
+			type: 'fakeip',
+			inet4_range: '198.18.0.0/15',
+			inet6_range: (ipv6_support === '1') ? 'fc00::/18' : null
+		});
+	}
+
 	/* Main DNS */
 	push(config.dns.servers, {
 		tag: 'main-dns',
@@ -459,7 +481,11 @@ if (!isEmpty(main_node)) {
 			server: (routing_mode === 'bypass_mainland_china') ? 'china-dns' : 'default-dns'
 		});
 
-	/* Filter out SVCB/HTTPS queries for "exquisite" Apple devices */
+	/* Filter out SVCB/HTTPS queries for "exquisite" Apple devices.
+	 *
+	 * 'query_type' is a sb 1.14 rule item and is rejected at startup together
+	 * with the legacy 'strategy' DNS rule action option, which is used by the
+	 * predefined China DNS servers ('preferred_by' is the replacement). */
 	if (routing_mode === 'gfwlist' || length(proxy_domain_list))
 		push(config.dns.rules, {
 			rule_set: (routing_mode !== 'gfwlist') ? 'proxy-domain' : null,
@@ -482,14 +508,18 @@ if (!isEmpty(main_node)) {
 			push(config.dns.rules, {
 				rule_set: 'proxy-domain',
 				action: 'route',
-				server: 'main-dns'
+				server: (dns_mode === 'fakeip') ? 'fakeip-dns' : 'main-dns'
 			});
 
+		/* The legacy 'strategy' DNS rule action option is rejected at startup
+		 * as soon as the same DNS configuration uses sb 1.14 rule items, the
+		 * 'query_type' filter rule above is one of them. Without 'strategy'
+		 * both A and AAAA records are requested, and sing-box applies the
+		 * default strategy ('ipv4_only' unless IPv6 support is enabled). */
 		push(config.dns.rules, {
 			rule_set: 'geosite-cn',
 			action: 'route',
-			server: 'china-dns',
-			strategy: 'prefer_ipv6'
+			server: 'china-dns'
 		});
 		push(config.dns.rules, {
 			type: 'logical',
@@ -504,15 +534,33 @@ if (!isEmpty(main_node)) {
 				}
 			],
 			action: 'route',
-			server: 'china-dns',
-			strategy: 'prefer_ipv6'
+			server: 'china-dns'
 		});
 	}
+
+	if (has_fakeip)
+		push(config.dns.rules, {
+			query_type: ['A', 'AAAA'],
+			action: 'route',
+			server: fakeip_tag
+		});
 } else if (!isEmpty(default_outbound)) {
 	/* DNS servers */
 	uci.foreach(uciconfig, ucidnsserver, (cfg) => {
 		if (cfg.enabled !== '1')
 			return;
+
+		if (cfg.type === 'fakeip') {
+			has_fakeip = true;
+			fakeip_tag = 'cfg-' + cfg['.name'] + '-dns';
+			push(config.dns.servers, {
+				tag: fakeip_tag,
+				type: 'fakeip',
+				inet4_range: cfg.inet4_range || '198.18.0.0/15',
+				inet6_range: (ipv6_support === '1') ? (cfg.inet6_range || 'fc00::/18') : null
+			});
+			return;
+		}
 
 		let outbound = get_outbound(cfg.outbound);
 		if (outbound === 'direct-out' && isEmpty(self_mark))
@@ -536,6 +584,17 @@ if (!isEmpty(main_node)) {
 			detour: outbound
 		});
 	});
+
+	if (dns_mode === 'fakeip' && !has_fakeip) {
+		has_fakeip = true;
+		fakeip_tag = 'fakeip-dns';
+		push(config.dns.servers, {
+			tag: fakeip_tag,
+			type: 'fakeip',
+			inet4_range: '198.18.0.0/15',
+			inet6_range: (ipv6_support === '1') ? 'fc00::/18' : null
+		});
+	}
 
 	/* DNS rules */
 	uci.foreach(uciconfig, ucidnsrule, (cfg) => {
@@ -570,7 +629,9 @@ if (!isEmpty(main_node)) {
 			outbound: get_outbound(cfg.outbound),
 			action: cfg.action,
 			server: get_resolver(cfg.server),
-			strategy: cfg.domain_strategy,
+			/* the legacy 'strategy' DNS rule action option is no longer usable
+			 * together with sb 1.14 rule items such as 'ip_version' */
+			strategy: (cfg.ip_version || cfg.query_type) ? null : cfg.domain_strategy,
 			disable_cache: strToBool(cfg.dns_disable_cache),
 			rewrite_ttl: strToInt(cfg.rewrite_ttl),
 			client_subnet: cfg.client_subnet,
@@ -583,10 +644,87 @@ if (!isEmpty(main_node)) {
 		});
 	});
 
+	let final_server = get_resolver(dns_default_server);
+	if (final_server === fakeip_tag || isEmpty(final_server) || final_server === 'system-dns')
+		final_server = 'default-dns';
+	config.dns.final = final_server;
+
+	if (has_fakeip) {
+		let direct_rulesets = [];
+		let direct_domains = [];
+		let direct_domain_suffixes = [];
+
+		uci.foreach(uciconfig, uciroutingrule, (cfg) => {
+			if (cfg.enabled !== '1')
+				return;
+			if (get_outbound(cfg.outbound) !== 'direct-out')
+				return;
+
+			if (cfg.rule_set) {
+				let rs = get_ruleset(cfg.rule_set);
+				if (rs) {
+					if (type(rs) === 'array')
+						direct_rulesets = [...direct_rulesets, ...rs];
+					else
+						push(direct_rulesets, rs);
+				}
+			}
+			if (cfg.domain) {
+				if (type(cfg.domain) === 'array')
+					direct_domains = [...direct_domains, ...cfg.domain];
+				else
+					push(direct_domains, cfg.domain);
+			}
+			if (cfg.domain_suffix) {
+				if (type(cfg.domain_suffix) === 'array')
+					direct_domain_suffixes = [...direct_domain_suffixes, ...cfg.domain_suffix];
+				else
+					push(direct_domain_suffixes, cfg.domain_suffix);
+			}
+		});
+
+		let enabled_rulesets = {};
+		uci.foreach(uciconfig, uciruleset, (cfg) => {
+			if (cfg.enabled === '1')
+				enabled_rulesets['cfg-' + cfg['.name'] + '-rule'] = true;
+		});
+
+		let domain_rulesets = [];
+		for (let rs in direct_rulesets) {
+			if (!match(rs, /geoip/) && enabled_rulesets[rs])
+				push(domain_rulesets, rs);
+		}
+
+		if (length(domain_rulesets))
+			push(config.dns.rules, {
+				rule_set: uniq(domain_rulesets),
+				action: 'route',
+				server: final_server
+			});
+
+		if (length(direct_domains))
+			push(config.dns.rules, {
+				domain: uniq(direct_domains),
+				action: 'route',
+				server: final_server
+			});
+
+		if (length(direct_domain_suffixes))
+			push(config.dns.rules, {
+				domain_suffix: uniq(direct_domain_suffixes),
+				action: 'route',
+				server: final_server
+			});
+
+		push(config.dns.rules, {
+			query_type: ['A', 'AAAA'],
+			action: 'route',
+			server: fakeip_tag
+		});
+	}
+
 	if (isEmpty(config.dns.rules))
 		config.dns.rules = null;
-
-	config.dns.final = get_resolver(dns_default_server);
 }
 /* DNS end */
 
@@ -606,8 +744,6 @@ push(config.inbounds, {
 	listen: '::',
 	listen_port: int(mixed_port),
 	udp_timeout: strToTime(udp_timeout),
-	sniff: true,
-	sniff_override_destination: strToBool(sniff_override),
 	set_system_proxy: false
 });
 
@@ -617,9 +753,7 @@ if (match(proxy_mode, /redirect/))
 		tag: 'redirect-in',
 
 		listen: '::',
-		listen_port: int(redirect_port),
-		sniff: true,
-		sniff_override_destination: strToBool(sniff_override)
+		listen_port: int(redirect_port)
 	});
 if (match(proxy_mode, /tproxy/))
 	push(config.inbounds, {
@@ -629,9 +763,7 @@ if (match(proxy_mode, /tproxy/))
 		listen: '::',
 		listen_port: int(tproxy_port),
 		network: 'udp',
-		udp_timeout: strToTime(udp_timeout),
-		sniff: true,
-		sniff_override_destination: strToBool(sniff_override)
+		udp_timeout: strToTime(udp_timeout)
 	});
 if (match(proxy_mode, /tun/))
 	push(config.inbounds, {
@@ -644,9 +776,7 @@ if (match(proxy_mode, /tun/))
 		auto_route: false,
 		endpoint_independent_nat: strToBool(endpoint_independent_nat),
 		udp_timeout: strToTime(udp_timeout),
-		stack: tcpip_stack,
-		sniff: true,
-		sniff_override_destination: strToBool(sniff_override)
+		stack: tcpip_stack
 	});
 /* Inbound end */
 
@@ -812,10 +942,12 @@ config.route = {
 if (!isEmpty(main_node)) {
 	/* Avoid DNS loop */
 	config.route.default_domain_resolver = {
-		action: 'route',
 		server: (routing_mode === 'bypass_mainland_china') ? 'china-dns' : 'default-dns',
 		strategy: (ipv6_support !== '1') ? 'prefer_ipv4' : null
 	};
+
+	/* Sniffing is no longer an inbound option since sb 1.14 */
+	map(generate_sniff_rules(), (rule) => push(config.route.rules, rule));
 
 	/* Direct list */
 	if (length(direct_domain_list))
@@ -887,12 +1019,22 @@ if (!isEmpty(main_node)) {
 	if (isEmpty(config.route.rule_set))
 		config.route.rule_set = null;
 } else if (!isEmpty(default_outbound)) {
+	let default_resolver = get_resolver(default_outbound_dns);
+	if (default_resolver === fakeip_tag || isEmpty(default_resolver) || default_resolver === 'system-dns') {
+		let final_dns = get_resolver(dns_default_server);
+		if (final_dns && final_dns !== fakeip_tag && final_dns !== 'system-dns')
+			default_resolver = final_dns;
+		else
+			default_resolver = 'default-dns';
+	}
 	config.route.default_domain_resolver = {
-		action: 'resolve',
-		server: get_resolver(default_outbound_dns)
+		server: default_resolver
 	};
 
-	if (domain_strategy)
+	/* Sniffing is no longer an inbound option since sb 1.14 */
+	map(generate_sniff_rules(), (rule) => push(config.route.rules, rule));
+
+	if (domain_strategy && dns_mode !== 'fakeip')
 		push(config.route.rules, {
 			action: 'resolve',
 			strategy: domain_strategy
@@ -959,13 +1101,13 @@ if (!isEmpty(main_node)) {
 /* Routing rules end */
 
 /* Experimental start */
-if (routing_mode in ['bypass_mainland_china', 'custom']) {
+if (routing_mode in ['bypass_mainland_china', 'custom'] || dns_mode === 'fakeip' || has_fakeip) {
 	config.experimental = {
 		cache_file: {
 			enabled: true,
 			path: RUN_DIR + '/cache.db',
-			store_rdrc: strToBool(cache_file_store_rdrc),
-			rdrc_timeout: strToTime(cache_file_rdrc_timeout),
+			store_fakeip: (dns_mode === 'fakeip' || has_fakeip),
+			store_dns: true
 		}
 	};
 }
